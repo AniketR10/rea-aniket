@@ -427,6 +427,29 @@ it.each([
   },
 );
 
+it("decodes FDO metadata up to 64 KiB and keeps larger notes undecoded", () => {
+  // `[{},{},…]`: dense values whose decoded tree far exceeds their bytes.
+  const dense = (bytes: number): Buffer => {
+    const count = Math.floor((bytes - 2) / 3);
+    const json = Buffer.from(`[${"{},".repeat(count - 1)}{}]`, "latin1");
+    return Buffer.concat([json, Buffer.alloc(bytes - json.length)]);
+  };
+  const at = (descriptor: Buffer) =>
+    parse(
+      elfNoteFixture({
+        ownership: "program",
+        notes: elfNote("FDO", 0x407c0c0a, descriptor),
+      }),
+    ).entries[0]?.fdo;
+  expect(dense(65536)).toHaveLength(65536);
+  expect(at(dense(65536))?.metadata).toHaveLength(21844);
+  const over = Buffer.concat([dense(65536), Buffer.alloc(1)]);
+  expect(at(over)).toEqual({
+    metadata: null,
+    issue: "FDO metadata exceeds the 65536-byte decode limit.",
+  });
+});
+
 it("leaves other FDO note types undecoded", () => {
   const report = parse(
     elfNoteFixture({

@@ -64,7 +64,8 @@ For `FDO` notes, `fdo.metadata` holds the JSON from
 Packaging metadata must be a JSON object and dlopen metadata a JSON array,
 stored as NUL-terminated UTF-8 followed only by NUL padding. A descriptor that
 breaks those rules keeps its entry, hash, and location, with `metadata` null
-and `issue` naming the rule. Keys are not checked against the specifications.
+and `issue` naming the rule. Descriptors larger than 64 KiB are not decoded
+and report the limit the same way. Keys are not checked against the specifications.
 This metadata is what the producer declared; it is not verified against a
 package database or the libraries a loader would open. Other FDO note types and
 other owners keep `fdo` null.
@@ -88,7 +89,9 @@ within that ceiling. If admission fails, the error reports the required
 scan budget for the same source and decoded names. Repeated table ranges count again. Each descriptor range is hashed once,
 each GNU version's trailing NUL run is scanned once, and each FDO descriptor is
 decoded once; none of those walks may exceed that byte ceiling. Retained FDO
-JSON text counts against the shared budget for every entry that repeats it. Malformed ELF headers, truncated header
+JSON text counts against the shared budget for every entry that repeats it.
+Only FDO descriptors up to 64 KiB are decoded, because a decoded JSON tree can
+take about 50 times its source bytes in memory. Malformed ELF headers, truncated header
 tables, declared note tables that extend past the file, and truncated
 note entries fail without partial success. ELF extended
 numbering (`PN_XNUM`, including a section count stored when `e_shnum` is 0) is

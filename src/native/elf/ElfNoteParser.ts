@@ -27,6 +27,11 @@ const SHT_NOTE = 7;
 const SHT_STRTAB = 3;
 const SHF_COMPRESSED = 0x800n;
 const HEX_DESCRIPTOR_LIMIT = 64;
+/**
+ * Decoded JSON trees grow about 50x beyond their source bytes, before the
+ * service and Evidence copy them. Real FDO notes are a few hundred bytes.
+ */
+const FDO_DECODE_LIMIT = 65536;
 
 interface TextBudget {
   limit: number;
@@ -314,6 +319,10 @@ const decodeFdoDescriptor = (
     value: { metadata: null, issue },
     textBytes: issue.length,
   });
+  if (descriptor.length > FDO_DECODE_LIMIT)
+    return invalid(
+      `FDO metadata exceeds the ${String(FDO_DECODE_LIMIT)}-byte decode limit.`,
+    );
   const end = descriptor.indexOf(0);
   if (end < 0) return invalid("FDO metadata is not NUL-terminated.");
   if (descriptor.subarray(end).some((byte) => byte !== 0))
