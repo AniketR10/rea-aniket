@@ -441,6 +441,52 @@ it("leaves other FDO note types undecoded", () => {
   });
 });
 
+it("decodes a descriptor shared by different FDO note types per type", () => {
+  // A PT_NOTE packaging note whose 20-byte name hides an SHT_NOTE dlopen note
+  // header; both notes end on the same `[]` descriptor.
+  const notes = Buffer.alloc(36);
+  notes.writeUInt32LE(20, 0);
+  notes.writeUInt32LE(4, 4);
+  notes.writeUInt32LE(0xcafe1a7e, 8);
+  notes.write("FDO\0", 12, "latin1");
+  notes.writeUInt32LE(4, 16);
+  notes.writeUInt32LE(4, 20);
+  notes.writeUInt32LE(0x407c0c0a, 24);
+  notes.write("FDO\0[]\0\0", 28, "latin1");
+  const notesOffset = 64 + 56;
+  const shoff = notesOffset + notes.length + 4;
+  const program = Buffer.alloc(56);
+  program.writeUInt32LE(4, 0);
+  program.writeBigUInt64LE(BigInt(notesOffset), 8);
+  program.writeBigUInt64LE(BigInt(notes.length), 32);
+  program.writeBigUInt64LE(4n, 48);
+  const section = Buffer.alloc(64);
+  section.writeUInt32LE(7, 4);
+  section.writeBigUInt64LE(BigInt(notesOffset + 16), 24);
+  section.writeBigUInt64LE(BigInt(notes.length - 16), 32);
+  section.writeBigUInt64LE(4n, 48);
+  const report = parse(
+    Buffer.concat([
+      elf64({ phoff: 64, phnum: 1, shoff, shnum: 2 }),
+      program,
+      notes,
+      Buffer.alloc(4),
+      Buffer.alloc(64),
+      section,
+    ]),
+  );
+  expect(report.entries[0]?.descriptor.location).toEqual(
+    report.entries[1]?.descriptor.location,
+  );
+  expect(report.entries.map(({ type_name, fdo }) => [type_name, fdo])).toEqual([
+    [
+      "fdo_packaging_metadata",
+      { metadata: null, issue: "FDO packaging metadata is not a JSON object." },
+    ],
+    ["fdo_dlopen_metadata", { metadata: [], issue: null }],
+  ]);
+});
+
 it("reads a big-endian ELF32 GNU build-id", () => {
   const notes = gnuBuildIdNote(undefined, false);
   const report = parse(

@@ -354,15 +354,17 @@ const decodeFdo = (
     typeName !== "fdo_dlopen_metadata"
   )
     return null;
-  const range = `${String(descriptor.byteOffset)}:${String(descriptor.length)}`;
-  let decoded = text.fdo.get(range);
+  // Overlapping tables can give one descriptor range different FDO types, and
+  // the type selects the required JSON shape.
+  const key = `${typeName}:${String(descriptor.byteOffset)}:${String(descriptor.length)}`;
+  let decoded = text.fdo.get(key);
   if (decoded === undefined) {
     chargeText(text, descriptor.length, "scanned");
     decoded = decodeFdoDescriptor(
       descriptor,
       typeName === "fdo_dlopen_metadata" ? "array" : "object",
     );
-    text.fdo.set(range, decoded);
+    text.fdo.set(key, decoded);
   }
   chargeText(text, decoded.textBytes);
   return decoded.value;
