@@ -427,27 +427,48 @@ it.each([
   },
 );
 
-it("decodes FDO metadata up to 64 KiB and keeps larger notes undecoded", () => {
+it("decodes FDO metadata within one 64 KiB allowance per report", () => {
   // `[{},{},…]`: dense values whose decoded tree far exceeds their bytes.
   const dense = (bytes: number): Buffer => {
     const count = Math.floor((bytes - 2) / 3);
     const json = Buffer.from(`[${"{},".repeat(count - 1)}{}]`, "latin1");
     return Buffer.concat([json, Buffer.alloc(bytes - json.length)]);
   };
-  const at = (descriptor: Buffer) =>
+  const fdo = (
+    descriptors: Buffer[],
+    ownership: "program" | "both" = "program",
+  ) =>
     parse(
       elfNoteFixture({
-        ownership: "program",
-        notes: elfNote("FDO", 0x407c0c0a, descriptor),
+        ownership,
+        notes: Buffer.concat(
+          descriptors.map((descriptor) =>
+            elfNote("FDO", 0x407c0c0a, descriptor),
+          ),
+        ),
       }),
-    ).entries[0]?.fdo;
-  expect(dense(65536)).toHaveLength(65536);
-  expect(at(dense(65536))?.metadata).toHaveLength(21844);
-  const over = Buffer.concat([dense(65536), Buffer.alloc(1)]);
-  expect(at(over)).toEqual({
+    ).entries.map((entry) => entry.fdo);
+  const spent = {
     metadata: null,
-    issue: "FDO metadata exceeds the 65536-byte decode limit.",
-  });
+    issue:
+      "FDO metadata exceeds the 65536-byte decode allowance shared by this report.",
+  };
+  expect(dense(65536)).toHaveLength(65536);
+  expect(fdo([dense(65536)])[0]?.metadata).toHaveLength(21844);
+  expect(fdo([Buffer.concat([dense(65536), Buffer.alloc(1)])])).toEqual([
+    spent,
+  ]);
+  // Distinct descriptors share the allowance in table order.
+  const [first, second] = fdo([dense(40000), dense(40000)]);
+  expect(first?.metadata).toHaveLength(13332);
+  expect(second).toEqual(spent);
+  // PT_NOTE and SHT_NOTE declarations of one 40,000-byte range charge the
+  // allowance once; twice would exceed it.
+  const padded = Buffer.concat([Buffer.from("[]"), Buffer.alloc(39998)]);
+  expect(fdo([padded], "both")).toEqual([
+    { metadata: [], issue: null },
+    { metadata: [], issue: null },
+  ]);
 });
 
 it("leaves other FDO note types undecoded", () => {

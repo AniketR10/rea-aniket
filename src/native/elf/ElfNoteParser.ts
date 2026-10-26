@@ -28,10 +28,11 @@ const SHT_STRTAB = 3;
 const SHF_COMPRESSED = 0x800n;
 const HEX_DESCRIPTOR_LIMIT = 64;
 /**
- * Decoded JSON trees grow about 50x beyond their source bytes, before the
- * service and Evidence copy them. Real FDO notes are a few hundred bytes.
+ * Source bytes of distinct FDO descriptors decoded per report. Decoded JSON
+ * trees grow about 50x beyond their source bytes, before the service and
+ * Evidence copy them. Real FDO notes are a few hundred bytes.
  */
-const FDO_DECODE_LIMIT = 65536;
+const FDO_DECODE_ALLOWANCE = 65536;
 
 interface TextBudget {
   limit: number;
@@ -41,6 +42,7 @@ interface TextBudget {
   readonly hashes: Map<string, string>;
   readonly scans: Map<string, number>;
   readonly fdo: Map<string, FdoDecode>;
+  fdoDecoded: number;
 }
 
 type FdoMetadata = NonNullable<ElfNotes["entries"][number]["fdo"]>;
@@ -307,6 +309,11 @@ const decodeGnu = (
   };
 };
 
+const invalid = (issue: string): FdoDecode => ({
+  value: { metadata: null, issue },
+  textBytes: issue.length,
+});
+
 /**
  * UAPI package and dlopen notes store one NUL-terminated, NUL-padded UTF-8
  * JSON string: an object for packaging metadata, an array for dlopen.
@@ -315,14 +322,6 @@ const decodeFdoDescriptor = (
   descriptor: Buffer,
   shape: "object" | "array",
 ): FdoDecode => {
-  const invalid = (issue: string): FdoDecode => ({
-    value: { metadata: null, issue },
-    textBytes: issue.length,
-  });
-  if (descriptor.length > FDO_DECODE_LIMIT)
-    return invalid(
-      `FDO metadata exceeds the ${String(FDO_DECODE_LIMIT)}-byte decode limit.`,
-    );
   const end = descriptor.indexOf(0);
   if (end < 0) return invalid("FDO metadata is not NUL-terminated.");
   if (descriptor.subarray(end).some((byte) => byte !== 0))
@@ -369,10 +368,17 @@ const decodeFdo = (
   let decoded = text.fdo.get(key);
   if (decoded === undefined) {
     chargeText(text, descriptor.length, "scanned");
-    decoded = decodeFdoDescriptor(
-      descriptor,
-      typeName === "fdo_dlopen_metadata" ? "array" : "object",
-    );
+    if (descriptor.length > FDO_DECODE_ALLOWANCE - text.fdoDecoded)
+      decoded = invalid(
+        `FDO metadata exceeds the ${String(FDO_DECODE_ALLOWANCE)}-byte decode allowance shared by this report.`,
+      );
+    else {
+      text.fdoDecoded += descriptor.length;
+      decoded = decodeFdoDescriptor(
+        descriptor,
+        typeName === "fdo_dlopen_metadata" ? "array" : "object",
+      );
+    }
     text.fdo.set(key, decoded);
   }
   chargeText(text, decoded.textBytes);
@@ -434,6 +440,7 @@ export const parseElfNotes = (
     hashes: new Map(),
     scans: new Map(),
     fdo: new Map(),
+    fdoDecoded: 0,
   };
   let shstrtab: Buffer | null = null;
   const sectionNameLimitations = new Set<string>();
