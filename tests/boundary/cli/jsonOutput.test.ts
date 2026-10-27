@@ -2,12 +2,13 @@ import { constants } from "node:buffer";
 import { createHash } from "node:crypto";
 import { Writable } from "node:stream";
 
-import { Cli, Formatter } from "incur";
+import { Cli } from "incur";
 import { estimateTokenCount } from "tokenx";
 import { parse as parseYaml } from "yaml";
 import { describe, expect, it } from "vitest";
 
 import { writeJsonOutput } from "../../../src/cli/jsonOutput.js";
+import { parseCliOutputArguments } from "../../../src/cliOutput.js";
 import {
   createCliResultOutput,
   streamCliCommandResults,
@@ -38,6 +39,44 @@ const collect = async (
   await writeJsonOutput(value, destination, format);
   return Buffer.concat(chunks).toString("utf8");
 };
+
+describe("SDK output completion", () => {
+  it.each(["json", "toon"])(
+    "waits for pending raw %s writes before exit",
+    async (format) => {
+      const document = JSON.stringify({
+        code: "VALIDATION_ERROR",
+        message: "x".repeat(8192),
+      });
+      let complete = false;
+      const destination = new Writable({
+        highWaterMark: 1,
+        write(chunk, _encoding, callback) {
+          if (chunk.length === 0) {
+            callback();
+            return;
+          }
+          setImmediate(() => {
+            complete = true;
+            callback();
+          });
+        },
+      });
+      const output = createCliResultOutput(
+        parseCliOutputArguments(["--format", format]),
+        destination,
+      );
+      if (output === undefined)
+        throw new Error("Expected valid output controls");
+      expect(output.captureSdkOutput(document)).toBe(false);
+      destination.write(document);
+      expect(complete).toBe(false);
+      await output.finishSdkOutput(1);
+      expect(complete).toBe(true);
+      expect(destination.writableEnded).toBe(false);
+    },
+  );
+});
 
 describe("incremental CLI JSON", () => {
   it.each([
@@ -162,6 +201,48 @@ describe("incremental CLI JSON", () => {
   );
 });
 
+describe("CLI command output wrapping", () => {
+  it("wraps a mounted group root reached through its alias", async () => {
+    const chunks: Buffer[] = [];
+    const destination = new Writable({
+      write(chunk: Buffer, _encoding, callback) {
+        chunks.push(chunk);
+        callback();
+      },
+    });
+    const output = createCliResultOutput(
+      parseCliOutputArguments(["--format", "json", "--full-output"]),
+      destination,
+    );
+    if (output === undefined)
+      throw new Error("Missing structured output surface");
+
+    const group = Cli.create("nested", {
+      aliases: ["nested-alias"],
+      run: () => ({ kind: "group-root" }),
+    }).command("child", { run: () => ({ kind: "child" }) });
+    const cli = Cli.create("rea-output-group-test", { sync: false }).command(
+      group,
+    );
+    streamCliCommandResults(cli, output);
+
+    let fallback = "";
+    await cli.serve(["nested-alias", "--format", "json"], {
+      stdout: (text) => {
+        if (!output.handled) fallback += text;
+      },
+    });
+
+    expect(output.handled).toBe(true);
+    expect(fallback).toBe("");
+    expect(JSON.parse(Buffer.concat(chunks).toString("utf8"))).toMatchObject({
+      ok: true,
+      data: { kind: "group-root" },
+      meta: { command: "nested" },
+    });
+  });
+});
+
 describe("CLI result output surface", () => {
   it.each(["json", "yaml", "toon", "md"] as const)(
     "places typed analysis failures in the full-output error envelope (%s)",
@@ -193,11 +274,17 @@ describe("CLI result output surface", () => {
         "--filter-output",
         "message",
       ];
-      const output = createCliResultOutput(argv, destination);
+      const output = createCliResultOutput(
+        parseCliOutputArguments(argv),
+        destination,
+      );
       if (output === undefined)
         throw new Error("Missing structured output surface");
       const cli = Cli.create("rea-output-test", { sync: false });
-      registerManagedCommands(cli, silentLogger, async () => failure);
+      registerManagedCommands(cli, silentLogger, async () => ({
+        ok: false,
+        error: failure,
+      }));
       streamCliCommandResults(cli, output);
       let fallback = "";
       const previousExitCode = process.exitCode;
@@ -270,7 +357,10 @@ describe("CLI result output surface", () => {
       },
     });
     const argv = ["fixture", "--json", "--full-output"];
-    const output = createCliResultOutput(argv, destination);
+    const output = createCliResultOutput(
+      parseCliOutputArguments(argv),
+      destination,
+    );
     if (output === undefined) throw new Error("Missing JSON output surface");
     const cli = Cli.create("rea-output-test", { sync: false });
     cli.command("fixture", {
@@ -315,16 +405,22 @@ describe("full-output token windows", () => {
       "--token-limit",
       "3",
     ];
-    const output = createCliResultOutput(argv, destination);
+    const output = createCliResultOutput(
+      parseCliOutputArguments(argv),
+      destination,
+    );
     if (output === undefined) throw new Error("Missing TOON output surface");
     const cli = Cli.create("rea-output-test", { sync: false });
     registerManagedCommands(cli, silentLogger, async () => ({
-      code: "target_unavailable",
-      category: "unavailable",
-      message: "The selected artifact is missing.",
-      retryable: false,
-      remediation: { action: "Check that the path exists." },
-      details: { source: "artifact-open" },
+      ok: false,
+      error: {
+        code: "target_unavailable",
+        category: "unavailable",
+        message: "The selected artifact is missing.",
+        retryable: false,
+        remediation: { action: "Check that the path exists." },
+        details: { source: "artifact-open" },
+      },
     }));
     streamCliCommandResults(cli, output);
     const previousExitCode = process.exitCode;
@@ -361,7 +457,10 @@ describe("logger classification handoff", () => {
       source: "captured-metadata",
     };
     const argv = ["fixture", "--json", "--full-output"];
-    const output = createCliResultOutput(argv, destination);
+    const output = createCliResultOutput(
+      parseCliOutputArguments(argv),
+      destination,
+    );
     if (output === undefined) throw new Error("Missing JSON output surface");
     const cli = Cli.create("rea-output-test", { sync: false });
     cli.command("fixture", {
@@ -414,22 +513,94 @@ describe("full-output token counts", () => {
       "--filter-output",
       "message",
     ];
-    const output = createCliResultOutput(argv, destination);
+    const output = createCliResultOutput(
+      parseCliOutputArguments(argv),
+      destination,
+    );
     if (output === undefined) throw new Error("Missing JSON output surface");
-    const cli = Cli.create("rea-output-test", { sync: false });
-    registerManagedCommands(cli, silentLogger, async () => failure);
-    streamCliCommandResults(cli, output);
-    const previousExitCode = process.exitCode;
-    try {
-      await cli.serve(argv, { stdout: () => undefined });
-      expect(process.exitCode).toBe(1);
-    } finally {
-      process.exitCode = previousExitCode;
-    }
+    await output.write(failure, {
+      command: "inspect-managed-artifact",
+      duration: "0ms",
+      format: "json",
+    });
     expect(output.handled).toBe(true);
     expect(Buffer.concat(chunks).toString("utf8")).toBe(
-      `${estimateTokenCount(Formatter.format(failure, "json"))}\n`,
+      `${estimateTokenCount(JSON.stringify({ ok: false, error: failure, meta: { command: "inspect-managed-artifact", duration: "0ms" } }) + "\n")}\n`,
     );
+  });
+  it("counts the exact emitted JSON representation and selected document", async () => {
+    const metadata = { command: "fixture", duration: "0ms", format: "json" };
+    for (const terminal of [false, true]) {
+      for (const flags of [
+        [],
+        ["--full-output"],
+        ["--filter-output", "missing"],
+        ["--format", "jsonl"],
+      ]) {
+        const argv = ["fixture", "--json", ...flags];
+        const render = async (count: boolean) => {
+          const chunks: Buffer[] = [];
+          const destination = new Writable({
+            write(chunk: Buffer, _encoding, callback) {
+              chunks.push(chunk);
+              callback();
+            },
+          });
+          Object.defineProperty(destination, "isTTY", { value: terminal });
+          const output = createCliResultOutput(
+            parseCliOutputArguments([
+              ...argv,
+              ...(count ? ["--token-count"] : []),
+            ]),
+            destination,
+          );
+          if (output === undefined) throw new Error("Missing output surface");
+          await output.write({ value: ["hello", "雪😀"] }, metadata);
+          return Buffer.concat(chunks).toString("utf8");
+        };
+        expect(Number((await render(true)).trim())).toBe(
+          estimateTokenCount(await render(false)),
+        );
+      }
+    }
+  });
+
+  it("normalizes exhausted failure window display coordinates", async () => {
+    const chunks: Buffer[] = [];
+    const destination = new Writable({
+      write(chunk: Buffer, _encoding, callback) {
+        chunks.push(chunk);
+        callback();
+      },
+    });
+    const output = createCliResultOutput(
+      parseCliOutputArguments([
+        "fixture",
+        "--format",
+        "toon",
+        "--full-output",
+        "--token-offset",
+        "100000",
+        "--token-limit",
+        "3",
+      ]),
+      destination,
+    );
+    if (output === undefined) throw new Error("Missing output surface");
+    await output.write(
+      {
+        code: "target_unavailable",
+        category: "unavailable",
+        message: "Missing target",
+        retryable: false,
+        remediation: { action: "Select an available target." },
+      },
+      { command: "fixture", duration: "0ms", format: "toon" },
+    );
+    const text = Buffer.concat(chunks).toString("utf8");
+    expect(text).toMatch(/showing tokens (\d+)–\1 of \1/);
+    expect(text).not.toContain("nextOffset");
+    expect(text).toContain("ok: false");
   });
 });
 
@@ -438,7 +609,12 @@ describe("CLI result output surface", () => {
     ["--json", "--token-limit", "5"],
     ["--json", "--format", "invalid"],
   ])("delegates unsupported output controls %j", (...arguments_) => {
-    expect(createCliResultOutput(arguments_, new Writable())).toBe(undefined);
+    expect(
+      createCliResultOutput(
+        parseCliOutputArguments(arguments_),
+        new Writable(),
+      ),
+    ).toBe(undefined);
   });
 
   it("keeps ownership after a failed write so no second document is emitted", async () => {
@@ -448,7 +624,10 @@ describe("CLI result output surface", () => {
         callback(cause);
       },
     });
-    const output = createCliResultOutput(["--json"], destination);
+    const output = createCliResultOutput(
+      parseCliOutputArguments(["--json"]),
+      destination,
+    );
     if (output === undefined) throw new Error("Missing JSON output surface");
     await expect(
       output.write(
@@ -492,15 +671,18 @@ describe("CLI result output surface", () => {
       },
     });
     const cli = Cli.create("rea-output-test", { sync: false });
-    registerManagedCommands(cli, silentLogger, async (path, operation) => {
+    registerManagedCommands(cli, silentLogger, async (...[path, operation]) => {
       expect(path).toBe("fixture.dll");
       expect(operation).toBe("inspect_managed_members");
-      return value;
+      return { ok: false, error: value };
     });
     // A terminal destination exercises the indented encoding past the limit.
     Object.defineProperty(destination, "isTTY", { value: true });
     const argv = ["inspect-managed-members", "fixture.dll", "--json"];
-    const output = createCliResultOutput(argv, destination);
+    const output = createCliResultOutput(
+      parseCliOutputArguments(argv),
+      destination,
+    );
     if (output === undefined) throw new Error("Missing JSON output surface");
     streamCliCommandResults(cli, output);
     let exitCode = 0;
@@ -521,7 +703,7 @@ describe("CLI result output surface", () => {
     const chunks: Buffer[] = [];
     const tokenArgv = [...argv, "--token-count", "--full-output"];
     const tokenOutput = createCliResultOutput(
-      tokenArgv,
+      parseCliOutputArguments(tokenArgv),
       new Writable({
         write(chunk: Buffer, _encoding, callback) {
           chunks.push(chunk);
@@ -532,7 +714,10 @@ describe("CLI result output surface", () => {
     if (tokenOutput === undefined)
       throw new Error("Missing token-count output surface");
     const tokenCli = Cli.create("rea-output-test", { sync: false });
-    registerManagedCommands(tokenCli, silentLogger, async () => value);
+    registerManagedCommands(tokenCli, silentLogger, async () => ({
+      ok: false,
+      error: value,
+    }));
     streamCliCommandResults(tokenCli, tokenOutput);
     await tokenCli.serve(tokenArgv, {
       stdout: (text) => {
@@ -544,7 +729,8 @@ describe("CLI result output surface", () => {
     });
     expect(exitCode).toBe(1);
     expect(fallbackBytes).toBe(0);
-    expect(JSON.parse(Buffer.concat(chunks).toString("utf8"))).toMatchObject({
+    const report = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    expect(report).toMatchObject({
       ok: false,
       error: {
         code: "resource_constraint",
@@ -553,7 +739,16 @@ describe("CLI result output surface", () => {
         },
         details: {
           reported_limits: {
-            formatted_characters: expectedCharacters - 1,
+            // Token counting uses the compact pipe encoding, unlike the
+            // terminal digest above. Count leaves, separators and framing.
+            formatted_characters:
+              count * encodedLeaf.length +
+              (count - 1) +
+              '{"methods":[]}'.length +
+              1 +
+              JSON.stringify({ ok: true, data: null, meta: report.meta })
+                .length -
+              4,
             max_string_characters: constants.MAX_STRING_LENGTH,
           },
         },
@@ -563,44 +758,58 @@ describe("CLI result output surface", () => {
   }, 60_000);
 });
 
-describe("streamed CLI TOON output", () => {
-  const serve = async (
-    argv: readonly string[],
-    value: JsonValue,
-    stream: boolean,
-  ): Promise<{ readonly text: string; readonly exitCode: number }> => {
-    const chunks: Buffer[] = [];
-    let fallback = "";
-    let exitCode = 0;
-    const output = stream
-      ? createCliResultOutput(
-          argv,
-          new Writable({
-            write(chunk: Buffer, _encoding, callback) {
-              chunks.push(chunk);
-              callback();
-            },
-          }),
-        )
-      : undefined;
-    const cli = Cli.create("rea-output-test", { sync: false });
-    registerManagedCommands(cli, silentLogger, async () => value);
-    if (output !== undefined) streamCliCommandResults(cli, output);
-    await cli.serve([...argv], {
-      stdout: (text) => {
-        if (output?.handled !== true) fallback += text;
-      },
-      exit: (code) => {
-        exitCode = code;
-      },
-    });
-    const text = fallback + Buffer.concat(chunks).toString("utf8");
-    return {
-      text: text.replace(/duration: \d+ms/gu, "duration: <ms>"),
-      exitCode,
-    };
-  };
+const sink = () => {
+  const chunks: Buffer[] = [];
+  const destination = new Writable({
+    write(chunk: Buffer, _encoding, callback) {
+      chunks.push(chunk);
+      callback();
+    },
+  });
+  return { destination, text: () => Buffer.concat(chunks).toString("utf8") };
+};
 
+const serve = async (
+  argv: readonly string[],
+  value: JsonValue,
+  stream: boolean,
+): Promise<{ readonly text: string; readonly exitCode: number }> => {
+  const { destination, text } = sink();
+  let fallback = "";
+  let exitCode = 0;
+  const output = stream
+    ? createCliResultOutput(parseCliOutputArguments(argv), destination)
+    : undefined;
+  const cli = Cli.create("rea-output-test", { sync: false });
+  registerManagedCommands(cli, silentLogger, async () => ({
+    ok: false,
+    error: value,
+  }));
+  if (output !== undefined) streamCliCommandResults(cli, output);
+  await cli.serve([...argv], {
+    stdout: (chunk) => {
+      if (output?.handled !== true) fallback += chunk;
+    },
+    exit: (code) => {
+      exitCode = code;
+    },
+  });
+  return {
+    text: (fallback + text()).replace(/duration: \d+ms/gu, "duration: <ms>"),
+    exitCode,
+  };
+};
+
+/** Tabular rows whose TOON lines fit, while the whole document does not. */
+const leaf = "x".repeat(64 * 1024);
+const row = `  ${leaf}\n`;
+const rows = Math.ceil(constants.MAX_STRING_LENGTH / row.length) + 1;
+const oversized = (): JsonValue => ({
+  methods: Array.from({ length: rows }, () => ({ name: leaf })),
+});
+const metadata = { command: "fixture", duration: "1ms", format: "toon" };
+
+describe("streamed CLI TOON output", () => {
   const scalars = {
     none: null,
     blank: "",
@@ -609,81 +818,45 @@ describe("streamed CLI TOON output", () => {
     note: "first\nsecond",
   };
 
-  it.each([
-    [[]],
-    [["--format", "toon"]],
-    [["--full-output"]],
-    [["--filter-output", "methods"]],
-    ...Object.keys(scalars).map((key) => [["--filter-output", key]]),
-  ])("writes the same TOON document as Incur for %j", async (options) => {
-    const argv = ["inspect-managed-members", "fixture.dll", ...options];
-    for (const value of [
-      {
-        assembly: "Fixture",
-        methods: [
-          { name: "Run", token: 100663297 },
-          { name: "Stop\nNow", token: 100663298 },
-        ],
-        flags: ["static", "public"],
-        empty: {},
-        ...scalars,
-      },
-      {},
-      ...Object.values(scalars),
-    ]) {
-      const streamed = await serve(argv, value, true);
-      const incur = await serve(argv, value, false);
-      expect(streamed).toEqual(incur);
-    }
-  });
-
-  it.each([
-    [[], false],
-    [["--format", "toon"], true],
-  ] as const)(
-    "leaves default terminal TOON to Incur's human rendering: %j",
-    async (options, streamed) => {
-      const chunks: Buffer[] = [];
-      const destination = new Writable({
-        write(chunk: Buffer, _encoding, callback) {
-          chunks.push(chunk);
-          callback();
+  // Paths main delegates to Incur. Owned filter projections keep their own
+  // formatter and never reach streaming below the string limit.
+  it.each([[[]], [["--format", "toon"]], [["--full-output"]]])(
+    "keeps TOON that fits a runtime string unchanged for %j",
+    async (options) => {
+      const argv = ["inspect-managed-members", "fixture.dll", ...options];
+      for (const value of [
+        {
+          assembly: "Fixture",
+          methods: [
+            { name: "Run", token: 100663297 },
+            { name: "Stop\nNow", token: 100663298 },
+          ],
+          flags: ["static", "public"],
+          empty: {},
+          ...scalars,
         },
-      });
-      Object.defineProperty(destination, "isTTY", { value: true });
-      const output = createCliResultOutput(
-        ["inspect-managed-members", "fixture.dll", ...options],
-        destination,
-      );
-      if (output === undefined) throw new Error("Missing output surface");
-      expect(
-        await output.write(
-          { assembly: "Fixture" },
-          { command: "fixture", duration: "1ms", format: "toon" },
-        ),
-      ).toBe(streamed);
-      expect(output.handled).toBe(streamed);
-      expect(Buffer.concat(chunks).toString("utf8")).toBe(
-        streamed ? "assembly: Fixture\n" : "",
-      );
+        {},
+        ...Object.values(scalars),
+      ]) {
+        const streamed = await serve(argv, value, true);
+        const incur = await serve(argv, value, false);
+        expect(streamed).toEqual(incur);
+      }
     },
   );
 
   it("streams TOON output past the engine string limit", async () => {
-    const leaf = "x".repeat(64 * 1024);
-    const row = `  ${leaf}\n`;
-    const count = Math.ceil(constants.MAX_STRING_LENGTH / row.length) + 1;
-    const header = `methods[${count}]{name}:\n`;
+    const header = `methods[${rows}]{name}:\n`;
     const expected = createHash("sha256").update(header);
-    for (let index = 0; index < count; index += 1) expected.update(row);
-    const expectedBytes = header.length + count * row.length;
+    for (let index = 0; index < rows; index += 1) expected.update(row);
+    const expectedBytes = header.length + rows * row.length;
     expect(expectedBytes).toBeGreaterThan(constants.MAX_STRING_LENGTH);
 
     const actual = createHash("sha256");
     let bytes = 0;
     const argv = ["inspect-managed-members", "fixture.dll"];
     const output = createCliResultOutput(
-      argv,
+      parseCliOutputArguments(argv),
       new Writable({
         write(chunk: Buffer, _encoding, callback) {
           bytes += chunk.length;
@@ -695,7 +868,8 @@ describe("streamed CLI TOON output", () => {
     if (output === undefined) throw new Error("Missing TOON output surface");
     const cli = Cli.create("rea-output-test", { sync: false });
     registerManagedCommands(cli, silentLogger, async () => ({
-      methods: Array.from({ length: count }, () => ({ name: leaf })),
+      ok: false,
+      error: oversized(),
     }));
     streamCliCommandResults(cli, output);
     let exitCode = 0;
@@ -710,15 +884,102 @@ describe("streamed CLI TOON output", () => {
     });
     expect(exitCode).toBe(0);
     expect(fallbackBytes).toBe(0);
+    expect(output.error).toBeUndefined();
     expect(bytes).toBe(expectedBytes);
     expect(actual.digest("hex")).toBe(expected.digest("hex"));
+  }, 60_000);
+});
+
+describe("oversized CLI TOON output", () => {
+  it("streams an oversized full-output failure envelope", async () => {
+    let bytes = 0;
+    let head = "";
+    let tail = Buffer.alloc(0);
+    const destination = new Writable({
+      write(chunk: Buffer, _encoding, callback) {
+        bytes += chunk.length;
+        if (head.length < 64) head += chunk.subarray(0, 64).toString("utf8");
+        tail = Buffer.concat([tail, chunk]).subarray(-64);
+        callback();
+      },
+    });
+    const argv = [
+      "inspect-managed-members",
+      "fixture.dll",
+      "--format",
+      "toon",
+      "--full-output",
+    ];
+    const output = createCliResultOutput(
+      parseCliOutputArguments(argv),
+      destination,
+    );
+    if (output === undefined) throw new Error("Missing TOON output surface");
+    expect(
+      await output.write(
+        {
+          error: "Analysis failed",
+          code: "target_unavailable",
+          category: "unavailable",
+          message: "The selected artifact is missing.",
+          retryable: false,
+          remediation: { action: "Check that the path exists." },
+          details: oversized(),
+        },
+        metadata,
+      ),
+    ).toBe(true);
+    expect(bytes).toBeGreaterThan(constants.MAX_STRING_LENGTH);
+    expect(head).toMatch(/^ok: false\nerror:\n/u);
+    expect(tail.toString("utf8").endsWith("duration: 1ms\n")).toBe(true);
+  }, 60_000);
+
+  it.each([
+    ["a default-format terminal", [], true],
+    ["a token count", ["--format", "toon", "--token-count"], false],
+  ] as const)(
+    "leaves oversized TOON for %s to the materialized formatter",
+    async (_case, options, terminal) => {
+      const { destination, text } = sink();
+      if (terminal)
+        Object.defineProperty(destination, "isTTY", { value: true });
+      const output = createCliResultOutput(
+        parseCliOutputArguments([
+          "inspect-managed-members",
+          "fixture.dll",
+          ...options,
+        ]),
+        destination,
+      );
+      if (output === undefined) throw new Error("Missing TOON output surface");
+      // Incur then formats the result, and recovery reports the typed
+      // capacity failure covered by the formatting recovery tests.
+      expect(await output.write(oversized(), metadata)).toBe(false);
+      expect(output.handled).toBe(false);
+      expect(text()).toBe("");
+    },
+    60_000,
+  );
+
+  it("leaves a TOON line longer than the string limit to capacity recovery", async () => {
+    const { destination, text } = sink();
+    const output = createCliResultOutput(
+      parseCliOutputArguments(["inspect-managed-members", "fixture.dll"]),
+      destination,
+    );
+    if (output === undefined) throw new Error("Missing TOON output surface");
+    // Primitive arrays are one TOON line, so this document cannot stream.
+    const inline = { names: Array.from({ length: rows }, () => leaf) };
+    expect(await output.write(inline, metadata)).toBe(false);
+    expect(output.handled).toBe(false);
+    expect(text()).toBe("");
   }, 60_000);
 });
 
 describe("streamed CLI filtered selections", () => {
   it.each([
     ["raw_result", "json", "null\n"],
-    ["raw_result", "jsonl", "null\n"],
+    ["raw_result", "jsonl", "JSONL_BOUNDARY_ERROR"],
     ["nested.value", "json", '{"nested":{"value":null}}\n'],
     ["missing", "json", "{}\n"],
     ["count", "json", "0\n"],
@@ -734,7 +995,12 @@ describe("streamed CLI filtered selections", () => {
         },
       });
       const output = createCliResultOutput(
-        ["--format", format, "--filter-output", filter],
+        parseCliOutputArguments([
+          "--format",
+          format,
+          "--filter-output",
+          filter,
+        ]),
         destination,
       );
       if (output === undefined) throw new Error("Missing JSON output surface");
@@ -742,7 +1008,14 @@ describe("streamed CLI filtered selections", () => {
         { raw_result: null, nested: { value: null }, count: 0, enabled: false },
         { command: "fixture", duration: "1ms", format },
       );
-      expect(Buffer.concat(chunks).toString("utf8")).toBe(expected);
+      const text = Buffer.concat(chunks).toString("utf8");
+      if (expected === "JSONL_BOUNDARY_ERROR")
+        expect(JSON.parse(text)).toMatchObject({
+          $rea: "jsonl/v1",
+          type: "error",
+          result: { code: "invalid_request", category: "invalid_input" },
+        });
+      else expect(text).toBe(expected);
     },
   );
 });
